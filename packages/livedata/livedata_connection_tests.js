@@ -42,21 +42,21 @@ Tinytest.add("livedata stub - receive data", function (test) {
   stream.receive({msg: 'data', collection: coll_name, id: '1234',
                   set: {a: 1}});
   // break throught the black box and test internal state
-  test.length(conn.queued[coll_name], 1);
+  test.length(conn._updatesForUnknownStores[coll_name], 1);
 
   // XXX: Test that the old signature of passing manager directly instead of in
   // options works.
   var coll = new Meteor.Collection(coll_name, conn);
 
   // queue has been emptied and doc is in db.
-  test.isUndefined(conn.queued[coll_name]);
+  test.isUndefined(conn._updatesForUnknownStores[coll_name]);
   test.equal(coll.find({}).fetch(), [{_id:'1234', a:1}]);
 
   // second message. applied directly to the db.
   stream.receive({msg: 'data', collection: coll_name, id: '1234',
                   set: {a:2}});
   test.equal(coll.find({}).fetch(), [{_id:'1234', a:2}]);
-  test.isUndefined(conn.queued[coll_name]);
+  test.isUndefined(conn._updatesForUnknownStores[coll_name]);
 });
 
 Tinytest.addAsync("livedata stub - subscribe", function (test, onComplete) {
@@ -146,8 +146,8 @@ Tinytest.add("livedata stub - methods", function (test) {
 
   startAndConnect(test, stream);
 
-  var coll_name = Meteor.uuid();
-  var coll = new Meteor.Collection(coll_name, {manager: conn});
+  var collName = Meteor.uuid();
+  var coll = new Meteor.Collection(collName, {manager: conn});
 
   // setup method
   conn.methods({do_something: function (x) {
@@ -165,13 +165,13 @@ Tinytest.add("livedata stub - methods", function (test) {
 
 
   // call method with results callback
-  var callback_fired = false;
+  var callback1Fired = false;
   conn.call('do_something', 'friday!', function (err, res) {
     test.isUndefined(err);
     test.equal(res, '1234');
-    callback_fired = true;
+    callback1Fired = true;
   });
-  test.isFalse(callback_fired);
+  test.isFalse(callback1Fired);
 
   // observers saw the method run.
   test.equal(counts, {added: 1, removed: 0, changed: 0, moved: 0});
@@ -183,57 +183,87 @@ Tinytest.add("livedata stub - methods", function (test) {
 
   test.equal(coll.find({}).count(), 1);
   test.equal(coll.find({value: 'friday!'}).count(), 1);
+  var docId = coll.findOne({value: 'friday!'})._id;
 
-  // results result in callback
-  stream.receive({msg: 'result', id:message.id, result:"1234"});
-  test.isTrue(callback_fired);
+  // results does not yet result in callback, because data is not
+  // ready.
+  stream.receive({msg: 'result', id:message.id, result: "1234"});
+  test.isFalse(callback1Fired);
+
+  // result message doesn't affect data
+  test.equal(coll.find({}).count(), 1);
+  test.equal(coll.find({value: 'friday!'}).count(), 1);
+  test.equal(counts, {added: 1, removed: 0, changed: 0, moved: 0});
 
   // data methods do not show up (not quiescent yet)
-  stream.receive({msg: 'data', collection: coll_name, id: '1234',
+  stream.receive({msg: 'data', collection: collName, id: docId,
                   set: {value: 'tuesday'}});
-
   test.equal(coll.find({}).count(), 1);
   test.equal(coll.find({value: 'friday!'}).count(), 1);
   test.equal(counts, {added: 1, removed: 0, changed: 0, moved: 0});
 
   // send another methods (unknown on client)
-  callback_fired = false;
+  var callback2Fired = false;
   conn.call('do_something_else', 'monday', function (err, res) {
-    callback_fired = true;
+    callback2Fired = true;
   });
-  test.isFalse(callback_fired);
+  test.isFalse(callback1Fired);
+  test.isFalse(callback2Fired);
 
   // test we still send a method request to server
-  var message_2 = JSON.parse(stream.sent.shift());
-  test.equal(message_2, {msg: 'method', method: 'do_something_else',
-                         params: ['monday'], id:message_2.id});
+  var message2 = JSON.parse(stream.sent.shift());
+  test.equal(message2, {msg: 'method', method: 'do_something_else',
+                        params: ['monday'], id: message2.id});
 
-  // get the first data satisfied message. changes are still not applied
-  // to database.
+  // get the first data satisfied message. changes are applied to database even
+  // though another method is outstanding, because the other method didn't have
+  // a stub. and its callback is called.
   stream.receive({msg: 'data', 'methods': [message.id]});
+  test.isTrue(callback1Fired);
+  test.isFalse(callback2Fired);
 
   test.equal(coll.find({}).count(), 1);
-  test.equal(coll.find({value: 'friday!'}).count(), 1);
-  test.equal(counts, {added: 1, removed: 0, changed: 0, moved: 0});
+  test.equal(coll.find({value: 'tuesday'}).count(), 1);
+  test.equal(counts, {added: 1, removed: 0, changed: 1, moved: 0});
 
   // second result
-  stream.receive({msg: 'result', id:message_2.id, result:"bupkis"});
-  test.isTrue(callback_fired);
+  stream.receive({msg: 'result', id:message2.id, result:"bupkis"});
+  test.isFalse(callback2Fired);
 
-  // get second satisfied, now changes are applied.
-  stream.receive({msg: 'data', 'methods': [message_2.id]});
+  // get second satisfied; no new changes are applied.
+  stream.receive({msg: 'data', 'methods': [message2.id]});
+  test.isTrue(callback2Fired);
 
   test.equal(coll.find({}).count(), 1);
-  test.equal(coll.find({value: 'friday!'}).count(), 0);
-  test.equal(coll.find({value: 'tuesday', _id: '1234'}).count(), 1);
-  test.equal(counts, {added: 2, removed: 1, changed: 0, moved: 0});
+  test.equal(coll.find({value: 'tuesday', _id: docId}).count(), 1);
+  test.equal(counts, {added: 1, removed: 0, changed: 1, moved: 0});
 
   handle.stop();
 });
 
+var observeCursor = function (test, cursor) {
+  var counts = {added: 0, removed: 0, changed: 0, moved: 0};
+  var expectedCounts = _.clone(counts);
+  var handle = cursor.observe(
+    { added: function () { counts.added += 1; },
+      removed: function () { counts.removed += 1; },
+      changed: function () { counts.changed += 1; },
+      moved: function () { counts.moved += 1; }
+    });
+  return {
+    stop: _.bind(handle.stop, handle),
+    expectCallbacks: function (delta) {
+      _.each(delta, function (mod, field) {
+        expectedCounts[field] += mod;
+      });
+      test.equal(counts, expectedCounts);
+    }
+  };
+};
+
 
 // method calls another method in simulation. see not sent.
-Tinytest.add("livedata stub - sub methods", function (test) {
+Tinytest.add("livedata stub - methods calling methods", function (test) {
   var stream = new Meteor._StubStream();
   var conn = newConnection(stream);
 
@@ -252,15 +282,7 @@ Tinytest.add("livedata stub - sub methods", function (test) {
     }
   });
 
-  // setup observers
-  var counts = {added: 0, removed: 0, changed: 0, moved: 0};
-  var handle = coll.find({}).observe(
-    { added: function () { counts.added += 1; },
-      removed: function () { counts.removed += 1; },
-      changed: function () { counts.changed += 1; },
-      moved: function () { counts.moved += 1; }
-    });
-
+  var o = observeCursor(test, coll.find());
 
   // call method.
   conn.call('do_something');
@@ -272,148 +294,164 @@ Tinytest.add("livedata stub - sub methods", function (test) {
   test.length(stream.sent, 0);
 
   // but inner method runs locally.
-  test.equal(counts, {added: 1, removed: 0, changed: 0, moved: 0});
+  o.expectCallbacks({added: 1});
+  test.equal(coll.find().count(), 1);
+  var docId = coll.findOne()._id;
+  test.equal(coll.findOne(), {_id: docId, a: 1});
 
-  // we get the results (this is important to make the test not block
-  // auto-reload!)
+  // we get the results
   stream.receive({msg: 'result', id:message.id, result:"1234"});
 
-  // get data from the method. does not show up.
-  stream.receive({msg: 'data', collection: coll_name, id: '1234',
+  // get data from the method. data from this doc does not show up yet, but data
+  // from another doc does.
+  stream.receive({msg: 'data', collection: coll_name, id: docId,
                   set: {value: 'tuesday'}});
-  test.equal(counts, {added: 1, removed: 0, changed: 0, moved: 0});
+  o.expectCallbacks();
+  test.equal(coll.findOne(docId), {_id: docId, a: 1});
+  stream.receive({msg: 'data', collection: coll_name, id: 'monkey',
+                  set: {value: 'bla'}});
+  o.expectCallbacks({added: 1});
+  test.equal(coll.findOne(docId), {_id: docId, a: 1});
+  var newDoc = coll.findOne({value: 'bla'});
+  test.isTrue(newDoc);
+  test.equal(newDoc, {_id: newDoc._id, value: 'bla'});
 
-  // get method satisfied. data shows up.
+  // get method satisfied. all data shows up. the 'a' field is reverted and
+  // 'value' field is set.
   stream.receive({msg: 'data', 'methods': [message.id]});
-  test.equal(counts, {added: 2, removed: 1, changed: 0, moved: 0});
+  o.expectCallbacks({changed: 1});
+  test.equal(coll.findOne(docId), {_id: docId, value: 'tuesday'});
+  test.equal(coll.findOne(newDoc._id), {_id: newDoc._id, value: 'bla'});
 
-  handle.stop();
+  o.stop();
 });
 
-
-// initial connect
-// make a sub
-// do a method
-// satisfy sub
-// reconnect
-// method gets resent
-// get data from server
-// data NOT shown
-// satisfy method
-// data NOT shown
-// resatisfy sub
-// data is shown
 Tinytest.add("livedata stub - reconnect", function (test) {
   var stream = new Meteor._StubStream();
   var conn = newConnection(stream);
 
   startAndConnect(test, stream);
 
-  var coll_name = Meteor.uuid();
-  var coll = new Meteor.Collection(coll_name, {manager: conn});
+  var collName = Meteor.uuid();
+  var coll = new Meteor.Collection(collName, {manager: conn});
 
-  // setup observers
-  var counts = {added: 0, removed: 0, changed: 0, moved: 0};
-  var handle = coll.find({}).observe(
-    { added: function () { counts.added += 1; },
-      removed: function () { counts.removed += 1; },
-      changed: function () { counts.changed += 1; },
-      moved: function () { counts.moved += 1; }
-    });
+  var o = observeCursor(test, coll.find());
 
   // subscribe
-  var sub_callback_fired = false;
+  var subCallbackFired = false;
   var sub = conn.subscribe('my_data', function () {
-    sub_callback_fired = true;
+    subCallbackFired = true;
   });
-  test.isFalse(sub_callback_fired);
+  test.isFalse(subCallbackFired);
 
-  var sub_message = JSON.parse(stream.sent.shift());
-  test.equal(sub_message, {msg: 'sub', name: 'my_data', params: [],
-                           id: sub_message.id});
-
+  var subMessage = JSON.parse(stream.sent.shift());
+  test.equal(subMessage, {msg: 'sub', name: 'my_data', params: [],
+                          id: subMessage.id});
 
   // get some data. it shows up.
-  stream.receive({msg: 'data', collection: coll_name,
+  stream.receive({msg: 'data', collection: collName,
                   id: '1234', set: {a:1}});
 
   test.equal(coll.find({}).count(), 1);
-  test.equal(counts, {added: 1, removed: 0, changed: 0, moved: 0});
-  test.isFalse(sub_callback_fired);
+  o.expectCallbacks({added: 1});
+  test.isFalse(subCallbackFired);
 
-  stream.receive({msg: 'data', collection: coll_name,
+  stream.receive({msg: 'data', collection: collName,
                   id: '1234', set: {b:2},
-                  subs: [sub_message.id] // satisfy sub
+                  subs: [subMessage.id] // satisfy sub
                  });
-  test.isTrue(sub_callback_fired);
-  sub_callback_fired = false; // re-arm for test that it doesn't fire again.
+  test.isTrue(subCallbackFired);
+  subCallbackFired = false; // re-arm for test that it doesn't fire again.
 
   test.equal(coll.find({a:1, b:2}).count(), 1);
-  test.equal(counts, {added: 1, removed: 0, changed: 1, moved: 0});
+  o.expectCallbacks({changed: 1});
 
   // call method.
-  var method_callback_fired = false;
+  var methodCallbackFired = false;
   conn.call('do_something', function () {
-    method_callback_fired = true;
+    methodCallbackFired = true;
   });
-  conn.apply('do_something', [], {wait: true});
+  conn.apply('do_something_else', [], {wait: true});
+  conn.apply('do_something_later', []);
 
-  test.isFalse(method_callback_fired);
+  // XXX should test cases where methods half-finish before reset, with both
+  // halves
 
-  var method_message = JSON.parse(stream.sent.shift());
-  var wait_method_message = JSON.parse(stream.sent.shift());
-  test.equal(method_message, {msg: 'method', method: 'do_something',
-                              params: [], id:method_message.id});
+  test.isFalse(methodCallbackFired);
 
-  // more data. doesn't show up.
-  stream.receive({msg: 'data', collection: coll_name,
+  // The non-wait method should send, but not the wait method.
+  var methodMessage = JSON.parse(stream.sent.shift());
+  test.equal(methodMessage, {msg: 'method', method: 'do_something',
+                             params: [], id:methodMessage.id});
+  test.equal(stream.sent.length, 0);
+
+  // more data. shows up immediately because there was no relevant method stub.
+  stream.receive({msg: 'data', collection: collName,
                   id: '1234', set: {c:3}});
-  test.equal(coll.find({c:3}).count(), 0);
-  test.equal(counts, {added: 1, removed: 0, changed: 1, moved: 0});
+  test.equal(coll.findOne('1234'), {_id: '1234', a: 1, b: 2, c: 3});
+  o.expectCallbacks({changed: 1});
 
-  // stream reset. reconnect!
-  // we send a connect, our pending messages, and our subs.
+  // stream reset. reconnect!  we send a connect, our pending method, and our
+  // sub. The wait method still is blocked.
   stream.reset();
 
   test_got_message(test, stream, {msg: 'connect', session: SESSION_ID});
-  test_got_message(test, stream, method_message);
-  test_got_message(test, stream, wait_method_message);
-  test_got_message(test, stream, sub_message);
+  test_got_message(test, stream, methodMessage);
+  test_got_message(test, stream, subMessage);
 
   // reconnect with different session id
   stream.receive({msg: 'connected', session: SESSION_ID + 1});
 
-  // resend data. doesn't show up.
-  stream.receive({msg: 'data', collection: coll_name,
-                  id: '1234', set: {a:1, b:2, c:3}});
-  stream.receive({msg: 'data', collection: coll_name,
-                  id: '2345', set: {d:4}});
+  // resend data. doesn't show up: we're in reconnect quiescence.
+  stream.receive({msg: 'data', collection: collName,
+                  id: '1234', set: {a:1, b:2, c:3, d: 4}});
+  stream.receive({msg: 'data', collection: collName,
+                  id: '2345', set: {e: 5}});
+  test.equal(coll.findOne('1234'), {_id: '1234', a: 1, b: 2, c: 3});
+  test.isFalse(coll.findOne('2345'));
+  o.expectCallbacks();
 
-  test.equal(coll.find({c:3}).count(), 0);
-  test.equal(counts, {added: 1, removed: 0, changed: 1, moved: 0});
-
-  // satisfy and return method callback
+  // satisfy and return the method
   stream.receive({msg: 'data',
-                  methods: [method_message.id, wait_method_message.id]});
-
-  test.isFalse(method_callback_fired);
-  stream.receive({msg: 'result', id:method_message.id, result:"bupkis"});
-  stream.receive({msg: 'result', id:wait_method_message.id, result:"bupkis"});
-  test.isTrue(method_callback_fired);
+                  methods: [methodMessage.id]});
+  test.isFalse(methodCallbackFired);
+  stream.receive({msg: 'result', id:methodMessage.id, result:"bupkis"});
+  // The callback still doesn't fire (and we don't send the wait method): we're
+  // still in global quiescence
+  test.isFalse(methodCallbackFired);
+  test.equal(stream.sent.length, 0);
 
   // still no update.
-  test.equal(coll.find({c:3}).count(), 0);
-  test.equal(counts, {added: 1, removed: 0, changed: 1, moved: 0});
+  test.equal(coll.findOne('1234'), {_id: '1234', a: 1, b: 2, c: 3});
+  test.isFalse(coll.findOne('2345'));
+  o.expectCallbacks();
 
   // re-satisfy sub
-  stream.receive({msg: 'data', subs: [sub_message.id]});
+  stream.receive({msg: 'data', subs: [subMessage.id]});
 
-  // now the doc changes
-  test.equal(coll.find({c:3}).count(), 1);
-  test.equal(counts, {added: 2, removed: 0, changed: 2, moved: 0});
+  // now the doc changes and method callback is called, and the wait method is
+  // sent. the sub callback isn't re-called.
+  test.isTrue(methodCallbackFired);
+  test.isFalse(subCallbackFired);
+  test.equal(coll.findOne('1234'), {_id: '1234', a: 1, b: 2, c: 3, d: 4});
+  test.equal(coll.findOne('2345'), {_id: '2345', e: 5});
+  o.expectCallbacks({added: 1, changed: 1});
 
+  var waitMethodMessage = JSON.parse(stream.sent.shift());
+  test.equal(waitMethodMessage, {msg: 'method', method: 'do_something_else',
+                                 params: [], id: waitMethodMessage.id});
+  test.equal(stream.sent.length, 0);
+  stream.receive({msg: 'result', id: waitMethodMessage.id, result: "bupkis"});
+  test.equal(stream.sent.length, 0);
+  stream.receive({msg: 'data', methods: [waitMethodMessage.id]});
 
-  handle.stop();
+  // wait method done means we can send the third method
+  test.equal(stream.sent.length, 1);
+  var laterMethodMessage = JSON.parse(stream.sent.shift());
+  test.equal(laterMethodMessage, {msg: 'method', method: 'do_something_later',
+                                  params: [], id: laterMethodMessage.id});
+
+  o.stop();
 });
 
 Tinytest.add("livedata connection - reactive userId", function (test) {
@@ -425,7 +463,7 @@ Tinytest.add("livedata connection - reactive userId", function (test) {
   test.equal(conn.userId(), 1337);
 });
 
-Tinytest.add("livedata connection - two wait methods with reponse in order", function (test) {
+Tinytest.add("livedata connection - two wait methods", function (test) {
   var stream = new Meteor._StubStream();
   var conn = newConnection(stream);
   startAndConnect(test, stream);
@@ -441,25 +479,42 @@ Tinytest.add("livedata connection - two wait methods with reponse in order", fun
   conn.apply('do_something', ['two!'], {wait: true}, function() {
     responses.push('two');
   });
-  var two_message = JSON.parse(stream.sent.shift());
-  test.equal(two_message.params, ['two!']);
-  test.equal(responses, []);
+  // 'two!' isn't sent yet, because it's a wait method.
+  test.equal(stream.sent.length, 0);
 
   conn.apply('do_something', ['three!'], function() {
     responses.push('three');
   });
-  conn.apply('do_something', ['four!'], {wait: true}, function() {
+  conn.apply('do_something', ['four!'], function() {
     responses.push('four');
   });
 
-  conn.apply('do_something', ['five!'], function() { responses.push('five'); });
+  conn.apply('do_something', ['five!'], {wait: true}, function() {
+    responses.push('five');
+  });
 
-  // Verify that we did not send "three!" since we're waiting for
-  // "one!" and "two!" to send their response back
+  conn.apply('do_something', ['six!'], function() { responses.push('six'); });
+
+  // Verify that we did not send any more methods since we are still waiting on
+  // 'one!'.
   test.equal(stream.sent.length, 0);
+
+  // Let "one!" finish. Both messages are required to fire the callback.
   stream.receive({msg: 'result', id: one_message.id});
+  test.equal(responses, []);
+  stream.receive({msg: 'data', methods: [one_message.id]});
   test.equal(responses, ['one']);
 
+  // Now we've send out "two!".
+  var two_message = JSON.parse(stream.sent.shift());
+  test.equal(two_message.params, ['two!']);
+
+  // But still haven't sent "three!".
+  test.equal(stream.sent.length, 0);
+
+  // Let "two!" finish, with its end messages in the opposite order to "one!".
+  stream.receive({msg: 'data', methods: [two_message.id]});
+  test.equal(responses, ['one']);
   test.equal(stream.sent.length, 0);
   stream.receive({msg: 'result', id: two_message.id});
   test.equal(responses, ['one', 'two']);
@@ -472,58 +527,30 @@ Tinytest.add("livedata connection - two wait methods with reponse in order", fun
   var four_message = JSON.parse(stream.sent.shift());
   test.equal(four_message.params, ['four!']);
 
+  // Out of order response is OK for non-wait methods.
   stream.receive({msg: 'result', id: three_message.id});
-  test.equal(responses, ['one', 'two', 'three']);
-
-  test.equal(stream.sent.length, 0);
   stream.receive({msg: 'result', id: four_message.id});
-  test.equal(responses, ['one', 'two', 'three', 'four']);
+  stream.receive({msg: 'data', methods: [four_message.id]});
+  test.equal(responses, ['one', 'two', 'four']);
+  test.equal(stream.sent.length, 0);
 
-  // Verify that we just sent "five!"
+  // Let three finish too.
+  stream.receive({msg: 'data', methods: [three_message.id]});
+  test.equal(responses, ['one', 'two', 'four', 'three']);
+
+  // Verify that we just sent "five!" (the next wait method).
   test.equal(stream.sent.length, 1);
   var five_message = JSON.parse(stream.sent.shift());
   test.equal(five_message.params, ['five!']);
-});
+  test.equal(responses, ['one', 'two', 'four', 'three']);
 
-Tinytest.add("livedata connection - one wait method with response out of order", function (test) {
-  var stream = new Meteor._StubStream();
-  var conn = newConnection(stream);
-  startAndConnect(test, stream);
+  // Let five finish.
+  stream.receive({msg: 'result', id: five_message.id});
+  stream.receive({msg: 'data', methods: [five_message.id]});
+  test.equal(responses, ['one', 'two', 'four', 'three', 'five']);
 
-  // setup method
-  conn.methods({do_something: function (x) {}});
-
-  var responses = [];
-  conn.apply('do_something', ['one!'], function() { responses.push('one'); });
-  var one_message = JSON.parse(stream.sent.shift());
-  test.equal(one_message.params, ['one!']);
-
-  conn.apply('do_something', ['two!'], {wait: true}, function() {
-    responses.push('two');
-  });
-  var two_message = JSON.parse(stream.sent.shift());
-  test.equal(two_message.params, ['two!']);
-  test.equal(responses, []);
-
-  conn.apply('do_something', ['three!']);
-
-  // Verify that we did not send "three!" since we're waiting for
-  // "one!" and "two!" to send their response back
-  test.equal(stream.sent.length, 0);
-  stream.receive({msg: 'result', id: two_message.id});
-  test.equal(responses, []);
-
-  test.equal(stream.sent.length, 0);
-  stream.receive({msg: 'result', id: one_message.id});
-  test.equal(responses, ['one', 'two']); // Namely not two, one
-
-  // Verify that we just sent "three!" now that we got responses for
-  // "one!" and "two!"
-  test.equal(stream.sent.length, 1);
-  var three_message = JSON.parse(stream.sent.shift());
-  test.equal(three_message.params, ['three!']);
-  // Since we sent it, it should no longer be in "blocked_methods".
-  test.equal(conn.blocked_methods, []);
+  var six_message = JSON.parse(stream.sent.shift());
+  test.equal(six_message.params, ['six!']);
 });
 
 Tinytest.add("livedata connection - onReconnect prepends messages correctly with a wait method", function(test) {
@@ -535,6 +562,7 @@ Tinytest.add("livedata connection - onReconnect prepends messages correctly with
   conn.methods({do_something: function (x) {}});
 
   conn.onReconnect = function() {
+    conn.apply('do_something', ['reconnect zero']);
     conn.apply('do_something', ['reconnect one']);
     conn.apply('do_something', ['reconnect two'], {wait: true});
     conn.apply('do_something', ['reconnect three']);
@@ -548,21 +576,26 @@ Tinytest.add("livedata connection - onReconnect prepends messages correctly with
   stream.sent = [];
   stream.reset();
   test_got_message(
-    test, stream, {msg: 'connect', session: conn.last_session_id});
+    test, stream, {msg: 'connect', session: conn._lastSessionId});
 
   // Test that we sent what we expect to send, and we're blocked on
   // what we expect to be blocked. The subsequent logic to correctly
   // read the wait flag is tested separately.
   test.equal(_.map(stream.sent, function(msg) {
     return JSON.parse(msg).params[0];
-  }), ['reconnect one', 'reconnect two']);
-  test.equal(_.map(conn.blocked_methods, function(method) {
-    return [method.msg.params[0], method.wait];
+  }), ['reconnect zero', 'reconnect one']);
+
+  // black-box test:
+  test.equal(_.map(conn._outstandingMethodBlocks, function (block) {
+    return [block.wait, _.map(block.methods, function (method) {
+      return JSON.parse(method._message).params[0];
+    })];
   }), [
-    ['reconnect three', undefined/*==false*/],
-    ['one', undefined/*==false*/],
-    ['two', true],
-    ['three', undefined/*==false*/]
+    [false, ['reconnect zero', 'reconnect one']],
+    [true, ['reconnect two']],
+    [false, ['reconnect three', 'one']],
+    [true, ['two']],
+    [false, ['three']]
   ]);
 });
 
@@ -582,24 +615,32 @@ Tinytest.add("livedata connection - onReconnect prepends messages correctly with
 
   conn.apply('do_something', ['one']);
   conn.apply('do_something', ['two'], {wait: true});
-  conn.apply('do_something', ['three']);
+  conn.apply('do_something', ['three'], {wait: true});
+  conn.apply('do_something', ['four']);
 
   // reconnect
   stream.sent = [];
   stream.reset();
   test_got_message(
-    test, stream, {msg: 'connect', session: conn.last_session_id});
+    test, stream, {msg: 'connect', session: conn._lastSessionId});
 
   // Test that we sent what we expect to send, and we're blocked on
   // what we expect to be blocked. The subsequent logic to correctly
   // read the wait flag is tested separately.
   test.equal(_.map(stream.sent, function(msg) {
     return JSON.parse(msg).params[0];
-  }), ['reconnect one', 'reconnect two', 'reconnect three', 'one', 'two']);
-  test.equal(_.map(conn.blocked_methods, function(method) {
-    return [method.msg.params[0], method.wait];
+  }), ['reconnect one', 'reconnect two', 'reconnect three', 'one']);
+
+  // black-box test:
+  test.equal(_.map(conn._outstandingMethodBlocks, function (block) {
+    return [block.wait, _.map(block.methods, function (method) {
+      return JSON.parse(method._message).params[0];
+    })];
   }), [
-    ['three', undefined/*==false*/]
+    [false, ['reconnect one', 'reconnect two', 'reconnect three', 'one']],
+    [true, ['two']],
+    [true, ['three']],
+    [false, ['four']]
   ]);
 });
 

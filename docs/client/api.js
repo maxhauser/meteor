@@ -317,7 +317,6 @@ Template.api.connect = {
 };
 
 // onAutopublish
-// onQuiesce
 
 Template.api.meteor_collection = {
   id: "meteor_collection",

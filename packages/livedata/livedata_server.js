@@ -632,9 +632,9 @@ _.extend(Meteor._LivedataSubscription.prototype, {
     }
   },
 
-  _publishCursor: function (cursor, name) {
+  _publishCursor: function (cursor) {
     var self = this;
-    var collection = name || cursor.collection_name;
+    var collection = cursor._cursorDescription.collectionName;
 
     var observe_handle = cursor._observeUnordered({
       added: function (obj) {

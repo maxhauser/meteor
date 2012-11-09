@@ -195,13 +195,14 @@ _Mongo.prototype.update = function (collection_name, selector, mod, options) {
     throw err;
 };
 
-_Mongo.prototype.find = function (collection_name, selector, options) {
+_Mongo.prototype.find = function (collectionName, selector, options) {
   var self = this;
 
   if (arguments.length === 1)
     selector = {};
 
-  return _Mongo._makeCursor(self, collection_name, selector, options);
+  return new _Mongo.Cursor(
+    self, new _Mongo.CursorDescription(collectionName, selector, options));
 };
 
 _Mongo.prototype.findOne = function (collection_name, selector, options) {
@@ -239,68 +240,103 @@ _Mongo.prototype._ensureIndex = function (collectionName, index, options) {
   future.wait();
 };
 
-// Cursors
+// CURSORS
 
-// Returns a _Mongo.Cursor, or throws an exception on
-// failure. Creating a cursor involves a database query, and we block
-// until it returns.
-_Mongo._makeCursor = function (mongo, collection_name, selector, options) {
-  var future = new Future;
+// There are several classes which relate to cursors:
+//
+// _Mongo.CursorDescription represents the arguments used
+// to construct a cursor: collectionName, selector, and (find) options.
+//
+// _Mongo.SynchronousCursor is a wrapper around a MongoDB cursor
+// which includes fully-synchronous versions of forEach, etc.
+//
+// _Mongo.Cursor is the Meteor cursor object returned from find().
+// It wraps a SynchronousCursor (lazily: it doesn't contact Mongo
+// until you call a method like fetch or forEach on it).
+//
+// _Mongo.LiveResultsSet is the "observe handle" returned from observe
+// (and _observeUnordered). It also wraps a SynchronousCursor.
 
-  options = options || {};
-  selector = _Mongo._rewriteSelector(selector);
 
-  mongo._withCollection(collection_name, function (err, collection) {
-    if (err) {
-      future.ret([false, err]);
-      return;
-    }
-    var cursor = collection.find(selector, options.fields, {
-      sort: options.sort, limit: options.limit, skip: options.skip});
-    future.ret([true, cursor]);
-  });
-
-  var result = future.wait();
-  if (!(result[0]))
-    throw result[1];
-
-  return new _Mongo.Cursor(mongo, collection_name, selector, options,
-                           result[1]);
+_Mongo.CursorDescription = function (collectionName, selector, options) {
+  var self = this;
+  self.collectionName = collectionName;
+  self.selector = _Mongo._rewriteSelector(selector);
+  self.options = options || {};
 };
 
-// Do not call directly. Use _Mongo._makeCursor instead.
-_Mongo.Cursor = function (mongo, collection_name, selector, options, cursor) {
+_Mongo.Cursor = function (mongo, cursorDescription) {
   var self = this;
 
-  if (!cursor)
-    throw new Error("Cursor required");
-
-  // NB: 'options' and 'selector' have already been preprocessed by _makeCursor
-  self.mongo = mongo;
-  self.collection_name = collection_name;
-  self.selector = selector;
-  self.options = options;
-  self.cursor = cursor;
-  self._synchronousNextObject = Future.wrap(cursor.nextObject.bind(cursor));
-  self._synchronousCount = Future.wrap(cursor.count.bind(cursor));
-
-  self.visited_ids = {};
+  self._mongo = mongo;
+  // XXX _publishCursor looks at this field
+  self._cursorDescription = cursorDescription;
+  self._synchronousCursor = null;
 };
 
-_Mongo.Cursor.prototype._nextObject = function () {
+_.each(['forEach', 'map', 'rewind', 'fetch', 'count'], function (method) {
+  _Mongo.Cursor.prototype[method] = function () {
+    var self = this;
+
+    if (!self._synchronousCursor)
+      self._synchronousCursor = self._mongo._createSynchronousCursor(
+        self._cursorDescription);
+
+    return self._synchronousCursor[method].apply(
+      self._synchronousCursor, arguments);
+  };
+});
+
+_Mongo.prototype._createSynchronousCursor = function (cursorDescription) {
+  var self = this;
+
+  var future = new Future;
+  self._withCollection(
+    cursorDescription.collectionName, function (err, collection) {
+      if (err) {
+        future.ret([false, err]);
+        return;
+      }
+      var options = cursorDescription.options;
+      var dbCursor = collection.find(
+        cursorDescription.selector,
+        options.fields, {
+          sort: options.sort,
+          limit: options.limit,
+          skip: options.skip
+        });
+      future.ret([true, dbCursor]);
+    });
+
+  var result = future.wait();
+  if (!result[0])
+    throw result[1];
+
+  return new _Mongo.SynchronousCursor(result[1]);
+};
+
+_Mongo.SynchronousCursor = function (dbCursor) {
+  var self = this;
+  self._dbCursor = dbCursor;
+  self._synchronousNextObject = Future.wrap(dbCursor.nextObject.bind(dbCursor));
+  self._synchronousCount = Future.wrap(dbCursor.count.bind(dbCursor));
+  self._visitedIds = {};
+};
+
+_Mongo.SynchronousCursor.prototype._nextObject = function () {
   var self = this;
   while (true) {
     var doc = self._synchronousNextObject().wait();
     if (!doc || !doc._id) return null;
-    if (self.visited_ids[doc._id]) continue;
-    self.visited_ids[doc._id] = true;
+    if (self._visitedIds[doc._id]) continue;
+    self._visitedIds[doc._id] = true;
     return doc;
   }
 };
 
 // XXX Make more like ECMA forEach:
 //     https://github.com/meteor/meteor/pull/63#issuecomment-5320050
-_Mongo.Cursor.prototype.forEach = function (callback) {
+_Mongo.SynchronousCursor.prototype.forEach = function (callback) {
   var self = this;
 
   // We implement the loop ourself instead of using self.cursor.each, because
@@ -316,7 +352,7 @@ _Mongo.Cursor.prototype.forEach = function (callback) {
 // XXX Make more like ECMA map:
 //     https://github.com/meteor/meteor/pull/63#issuecomment-5320050
 // XXX Allow overlapping callback executions if callback yields.
-_Mongo.Cursor.prototype.map = function (callback) {
+_Mongo.SynchronousCursor.prototype.map = function (callback) {
   var self = this;
   var res = [];
   self.forEach(function (doc) {
@@ -325,26 +361,27 @@ _Mongo.Cursor.prototype.map = function (callback) {
   return res;
 };
 
-_Mongo.Cursor.prototype.rewind = function () {
+_Mongo.SynchronousCursor.prototype.rewind = function () {
   var self = this;
 
   // known to be synchronous
-  self.cursor.rewind();
+  self._dbCursor.rewind();
 
-  self.visited_ids = {};
+  self._visitedIds = {};
 };
 
-_Mongo.Cursor.prototype.fetch = function () {
+_Mongo.SynchronousCursor.prototype.fetch = function () {
   var self = this;
   return self.map(_.identity);
 };
 
-_Mongo.Cursor.prototype.count = function () {
+_Mongo.SynchronousCursor.prototype.count = function () {
   var self = this;
   return self._synchronousCount().wait();
 };
 
-_Mongo.Cursor.prototype._getRawObjects = function (ordered) {
+// This method is NOT exposed in _Mongo.Cursor.
+_Mongo.SynchronousCursor.prototype.getRawObjects = function (ordered) {
   var self = this;
   if (ordered) {
     return self.fetch();
@@ -371,102 +408,107 @@ _Mongo.Cursor.prototype._getRawObjects = function (ordered) {
 // attributes available on returned LiveResultsSet
 //  * stop(): end updates
 
-_Mongo.Cursor.prototype.observe = function (options) {
-  return new _Mongo.LiveResultsSet(this, true, options);
+_Mongo.prototype._getLiveResultsSet = function (cursorDescription, ordered,
+                                                callbacks) {
+  var self = this;
+  return new _Mongo.LiveResultsSet(
+    cursorDescription,
+    self._createSynchronousCursor(cursorDescription),
+    ordered,
+    callbacks);
 };
 
-_Mongo.Cursor.prototype._observeUnordered = function (options) {
-  return new _Mongo.LiveResultsSet(this, false, options);
+_Mongo.Cursor.prototype.observe = function (callbacks) {
+  var self = this;
+  return self._mongo._getLiveResultsSet(
+    self._cursorDescription, true, callbacks);
 };
 
-_Mongo.LiveResultsSet = function (cursor, ordered, options) {
+_Mongo.Cursor.prototype._observeUnordered = function (callbacks) {
+  var self = this;
+  return self._mongo._getLiveResultsSet(
+    self._cursorDescription, false, callbacks);
+};
+
+_Mongo.LiveResultsSet = function (cursorDescription, synchronousCursor, ordered,
+                                  callbacks) {
   var self = this;
 
-  // copy my cursor, so that the observe can run independently from
-  // some other use of the cursor.
-  self.cursor = _Mongo._makeCursor(cursor.mongo,
-                                   cursor.collection_name,
-                                   cursor.selector,
-                                   cursor.options);
+  self._cursorDescription = cursorDescription;
+  self._synchronousCursor = synchronousCursor;
 
-  // expose collection name
-  self.collection_name = cursor.collection_name;
-
-  self.ordered = ordered;
+  self._ordered = ordered;
 
   // previous results snapshot.  on each poll cycle, diffs against
   // results drives the callbacks.
-  self.results = ordered ? [] : {};
+  self._results = ordered ? [] : {};
 
   // state for polling
-  self.dirty = false; // do we need polling?
-  self.pending_writes = []; // people to notify when polling completes
-  self.poll_running = false; // is polling in progress now?
-  self.polling_suspended = false; // is polling temporarily suspended?
+  self._dirty = false; // do we need polling?
+  self._pendingWrites = []; // people to notify when polling completes
+  self._pollRunning = false; // is polling in progress now?
+  self._pollingSuspended = false; // is polling temporarily suspended?
 
   // (each instance of the class needs to get a separate throttling
   // context -- we don't want to coalesce invocations of markDirty on
   // different instances!)
-  self._markDirty = _.throttle(self._unthrottled_markDirty, 50 /* ms */);
+  self._markDirty = _.throttle(self._unthrottledMarkDirty, 50 /* ms */);
 
   // listen for the invalidation messages that will trigger us to poll
   // the database for changes
-  var keys = self.cursor.options.key || {collection: cursor.collection_name};
+  var keys = (cursorDescription.options.key ||
+              {collection: cursorDescription.collectionName});
   if (!(keys instanceof Array))
     keys = [keys];
-  self.crossbar_listeners = _.map(keys, function (key) {
-    return Meteor._InvalidationCrossbar.listen(key,function (notification,
-                                                             complete) {
+  self._crossbarListeners = _.map(keys, function (key) {
+    return Meteor._InvalidationCrossbar.listen(key, function (notification,
+                                                              complete) {
       // When someone does a transaction that might affect us,
       // schedule a poll of the database. If that transaction happens
       // inside of a write fence, block the fence until we've polled
       // and notified observers.
       var fence = Meteor._CurrentWriteFence.get();
       if (fence)
-        self.pending_writes.push(fence.beginWrite());
+        self._pendingWrites.push(fence.beginWrite());
       self._markDirty();
       complete();
     });
   });
 
   // user callbacks
-  self.added = options.added;
-  self.changed = options.changed;
-  self.removed = options.removed;
-  if (ordered)
-    self.moved = options.moved;
+  self._callbacks = callbacks;
 
   // run the first _poll() cycle synchronously.
-  self.poll_running = true;
+  self._pollRunning = true;
   self._doPoll();
-  self.poll_running = false;
+  self._pollRunning = false;
 
   // every once and a while, poll even if we don't think we're dirty,
   // for eventual consistency with database writes from outside the
   // Meteor universe
-  self.refreshTimer = Meteor.setInterval(_.bind(self._markDirty, this),
-                                         10 * 1000 /* 10 seconds */);
+  self._refreshTimer = Meteor.setInterval(_.bind(self._markDirty, this),
+                                          10 * 1000 /* 10 seconds */);
 };
 
-_Mongo.LiveResultsSet.prototype._unthrottled_markDirty = function () {
+_Mongo.LiveResultsSet.prototype._unthrottledMarkDirty = function () {
   var self = this;
 
-  self.dirty = true;
-  if (self.polling_suspended)
+  self._dirty = true;
+  if (self._pollingSuspended)
     return; // don't poll when told not to
-  if (self.poll_running)
+  if (self._pollRunning)
     return; // only one instance can run at once. just tell it to re-cycle.
-  self.poll_running = true;
+  self._pollRunning = true;
 
   Fiber(function () {
-    self.dirty = false;
-    var writes_for_cycle = self.pending_writes;
-    self.pending_writes = [];
-    self._doPoll(); // could yield, and set self.dirty
-    _.each(writes_for_cycle, function (w) {w.committed();});
+    self._dirty = false;
+    var writesForCycle = self._pendingWrites;
+    self._pendingWrites = [];
+    self._doPoll(); // could yield, and set self._dirty
+    _.each(writesForCycle, function (w) {w.committed();});
 
-    self.poll_running = false;
-    if (self.dirty || self.pending_writes.length)
+    self._pollRunning = false;
+    if (self._dirty || self._pendingWrites.length)
       // rerun ourselves, but through _.throttle
       self._markDirty();
   }).run();
@@ -474,11 +516,11 @@ _Mongo.LiveResultsSet.prototype._unthrottled_markDirty = function () {
 
 // interface for tests to control when polling happens
 _Mongo.LiveResultsSet.prototype._suspendPolling = function() {
-  this.polling_suspended = true;
+  this._pollingSuspended = true;
 };
 _Mongo.LiveResultsSet.prototype._resumePolling = function() {
-  this.polling_suspended = false;
-  this._unthrottled_markDirty(); // poll NOW, don't wait
+  this._pollingSuspended = false;
+  this._unthrottledMarkDirty(); // poll NOW, don't wait
 };
 
 
@@ -486,20 +528,19 @@ _Mongo.LiveResultsSet.prototype._doPoll = function () {
   var self = this;
 
   // Get the new query results
-  self.cursor.rewind();
-  var new_results = self.cursor._getRawObjects(self.ordered);
-  var old_results = self.results;
+  self._synchronousCursor.rewind();
+  var new_results = self._synchronousCursor.getRawObjects(self._ordered);
+  var old_results = self._results;
 
   LocalCollection._diffQuery(
-    self.ordered, old_results, new_results, self, true);
-  self.results = new_results;
-
+    self._ordered, old_results, new_results, self._callbacks, true);
+  self._results = new_results;
 };
 
 _Mongo.LiveResultsSet.prototype.stop = function () {
   var self = this;
-  _.each(self.crossbar_listeners, function (l) { l.stop(); });
-  Meteor.clearInterval(self.refreshTimer);
+  _.each(self._crossbarListeners, function (l) { l.stop(); });
+  Meteor.clearInterval(self._refreshTimer);
 };
 
 _.extend(Meteor, {

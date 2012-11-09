@@ -1,3 +1,4 @@
+(function(){
 // A write fence collects a group of writes, and provides a callback
 // when all of the writes are fully committed and propagated (all
 // observers have been notified of the write and acknowledged it.)
@@ -56,18 +57,6 @@ _.extend(Meteor._WriteFence.prototype, {
     self.completion_callbacks.push(func);
   },
 
-  // Convenience function. Arms the fence, then blocks until it fires.
-  // Only can be called on the server.
-  armAndWait: function () {
-    var self = this;
-    var future = new Future;
-    self.onAllCommitted(function () {
-      future['return']();
-    });
-    self.arm();
-    future.wait();
-  },
-
   _maybeFire: function () {
     var self = this;
     if (self.fired)
@@ -88,3 +77,21 @@ _.extend(Meteor._WriteFence.prototype, {
     self.retired = true;
   }
 });
+
+if (Meteor.isServer) {
+  var path = __meteor_bootstrap__.require('path');
+  var Future = __meteor_bootstrap__.require(path.join('fibers', 'future'));
+
+  // Convenience function. Arms the fence, then blocks until it fires.
+  // Only can be called on the server.
+  Meteor._WriteFence.prototype.armAndWait = function () {
+    var self = this;
+    var future = new Future;
+    self.onAllCommitted(function () {
+      future['return']();
+    });
+    self.arm();
+    future.wait();
+  };
+}
+})();

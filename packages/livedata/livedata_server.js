@@ -359,15 +359,10 @@ _.extend(Meteor._LivedataSession.prototype, {
         return;
       }
 
-      // if Meteor._RemoteCollectionDriver is available (defined in
-      // mongo-livedata), automatically wire up handlers that return a
-      // Cursor.  otherwise, the handler is completely responsible for
-      // delivering its own data messages and registering stop
-      // functions.
-      //
-      // XXX generalize
-      if (Meteor._RemoteCollectionDriver && (res instanceof Meteor._Mongo.Cursor))
-        sub._publishCursor(res);
+      // XXX should we document a variant on this interface and encourage users
+      // to use it?
+      if (res && res._publishCursor)
+        res._publishCursor(sub);
     };
 
     sub._runHandler();
@@ -630,41 +625,6 @@ _.extend(Meteor._LivedataSubscription.prototype, {
           self.pending_data[name][id][key] = undefined;
       }
     }
-  },
-
-  _publishCursor: function (cursor) {
-    var self = this;
-    var collection = cursor._cursorDescription.collectionName;
-
-    var observe_handle = cursor._observeUnordered({
-      added: function (obj) {
-        self.set(collection, obj._id, obj);
-        self.flush();
-      },
-      changed: function (obj, old_obj) {
-        var set = {};
-        _.each(obj, function (v, k) {
-          if (!_.isEqual(v, old_obj[k]))
-            set[k] = v;
-        });
-        self.set(collection, obj._id, set);
-        var dead_keys = _.difference(_.keys(old_obj), _.keys(obj));
-        self.unset(collection, obj._id, dead_keys);
-        self.flush();
-      },
-      removed: function (old_obj) {
-        self.unset(collection, old_obj._id, _.keys(old_obj));
-        self.flush();
-      }
-    });
-
-    // observe only returns after the initial added callbacks have
-    // run.  mark subscription as completed.
-    self.complete();
-    self.flush();
-
-    // register stop callback (expects lambda w/ no args).
-    self.onStop(_.bind(observe_handle.stop, observe_handle));
   }
 });
 

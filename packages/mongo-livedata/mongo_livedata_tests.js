@@ -238,8 +238,11 @@ Tinytest.addAsync("mongo-livedata - fuzz test", function(test, onComplete) {
     var max_counters = _.clone(counters);
 
     finishObserve(function () {
+      // XXX What if there are multiple observe handles on the LiveResultsSet?
+      //     There shouldn't be because the collection has a name unique to this
+      //     run.
       if (Meteor.isServer)
-        obs._suspendPolling();
+        obs._liveResultsSet._suspendPolling();
 
       // Do a batch of 1-10 operations
       var batch_count = rnd(10) + 1;
@@ -272,7 +275,7 @@ Tinytest.addAsync("mongo-livedata - fuzz test", function(test, onComplete) {
         }
       }
       if (Meteor.isServer)
-        obs._resumePolling();
+        obs._liveResultsSet._resumePolling();
 
     });
 

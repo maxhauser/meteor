@@ -7,7 +7,7 @@ if [ "$PREFIX" != "" ] ; then
 else
     PARENT="/usr/local"
 fi
-TARGET_DIR="$PARENT/meteor"
+TARGET_DIR="$PARENT/hotshot"
 
 # XXX try to fix it up automatically?
 if [ ! -d "$PARENT" -o ! -w "$PARENT" ] ; then
@@ -40,7 +40,7 @@ rm -rf "$TARGET_DIR"/examples/unfinished
 
 mkdir -p "$PARENT/bin"
 rm -f "$PARENT/bin/meteor"
-ln -s "$TARGET_DIR/bin/meteor" "$PARENT/bin/meteor"
+ln -s "$TARGET_DIR/bin/meteor" "$PARENT/bin/hotshot"
 
 # mark directory with current git sha
 git rev-parse HEAD > "$TARGET_DIR/.git_version.txt"

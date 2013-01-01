@@ -8,12 +8,12 @@
 // ##RUNTIME_CONFIG##
 </script>
 
-{{#each scripts}}  <script type="text/javascript" src="{{this}}"></script>
-{{/each}}
-
 {{{head_extra}}}
 </head>
 <body>
 {{{body_extra}}}
+<!-- ##BODY_CONTENT## -->
+{{#each scripts}}  <script type="text/javascript" src="{{this}}"></script>
+{{/each}}
 </body>
 </html>
